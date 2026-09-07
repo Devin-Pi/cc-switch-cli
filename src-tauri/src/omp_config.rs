@@ -1266,12 +1266,7 @@ pub(crate) fn set_omp_default_model(
             // an explicit selector must be accepted even when the registry
             // has not been populated yet. Static catalogs remain strict so a
             // typo cannot silently create a dangling role.
-            if !discovery_only {
-                let Some(models) = models.filter(|models| !models.is_empty()) else {
-                    return Err(AppError::InvalidInput(format!(
-                        "OMP provider '{provider_id}' has no model catalog; specify a discovery provider"
-                    )));
-                };
+            if let Some(models) = models.filter(|models| !models.is_empty()) {
                 if !models.iter().any(|model| {
                     model.get("id").and_then(Value::as_str).map(str::trim) == Some(model_id)
                 }) {
@@ -1279,6 +1274,10 @@ pub(crate) fn set_omp_default_model(
                         "OMP model '{provider_id}/{model_id}' is not present in models.yml"
                     )));
                 }
+            } else if !discovery_only {
+                return Err(AppError::InvalidInput(format!(
+                    "OMP provider '{provider_id}' has no model catalog; specify a discovery provider"
+                )));
             }
             model_id.to_string()
         }
