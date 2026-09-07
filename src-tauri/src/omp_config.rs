@@ -1252,33 +1252,52 @@ pub(crate) fn set_omp_default_model(
     // apply semantic validation without imposing CC Switch's HTTP-only probe
     // restriction.
     validate_provider_node_for_editor(provider_id, provider)?;
-    let models = provider
-        .get("models")
-        .and_then(Value::as_array)
-        .ok_or_else(|| {
-            AppError::InvalidInput(format!("OMP provider '{provider_id}' has no model catalog"))
-        })?;
+    let models = provider.get("models").and_then(Value::as_array);
+    let discovery_only = provider.get("discovery").is_some();
+    let has_static_models = models.is_some_and(|models| !models.is_empty());
     let selected = match model_id.map(str::trim) {
-        Some(model_id)
-            if models.iter().any(|model| {
-                model.get("id").and_then(Value::as_str).map(str::trim) == Some(model_id)
-            }) =>
-        {
-            model_id.to_string()
+        Some(model_id) if model_id.is_empty() => {
+            return Err(AppError::InvalidInput(
+                "OMP model id must be a non-empty string".to_string(),
+            ));
         }
         Some(model_id) => {
-            return Err(AppError::InvalidInput(format!(
-                "OMP model '{provider_id}/{model_id}' is not present in models.yml"
-            )))
+            // Discovery-backed providers may intentionally omit a static
+            // `models` catalog. OMP resolves those model ids at runtime, so
+            // an explicit selector must be accepted even when the registry
+            // has not been populated yet. Static catalogs remain strict so a
+            // typo cannot silently create a dangling role.
+            if !discovery_only {
+                let Some(models) = models.filter(|_| has_static_models) else {
+                    return Err(AppError::InvalidInput(format!(
+                        "OMP provider '{provider_id}' has no model catalog; specify a discovery provider"
+                    )));
+                };
+                if !models.iter().any(|model| {
+                    model.get("id").and_then(Value::as_str).map(str::trim) == Some(model_id)
+                }) {
+                    return Err(AppError::InvalidInput(format!(
+                        "OMP model '{provider_id}/{model_id}' is not present in models.yml"
+                    )));
+                }
+            }
+            model_id.to_string()
         }
-        None => models
-            .iter()
-            .find_map(|model| model.get("id").and_then(Value::as_str).map(str::trim))
-            .filter(|id| !id.is_empty())
-            .ok_or_else(|| {
-                AppError::InvalidInput(format!("OMP provider '{provider_id}' has no models"))
-            })?
-            .to_string(),
+        None => {
+            let Some(models) = models else {
+                return Err(AppError::InvalidInput(format!(
+                    "OMP provider '{provider_id}' has no static model catalog; specify --model for a discovery provider"
+                )));
+            };
+            models
+                .iter()
+                .find_map(|model| model.get("id").and_then(Value::as_str).map(str::trim))
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| {
+                    AppError::InvalidInput(format!("OMP provider '{provider_id}' has no models"))
+                })?
+                .to_string()
+        }
     };
 
     // External OMP edits are not coordinated by our mutex.  Refuse to write a
@@ -5082,6 +5101,36 @@ mod tests {
         if let Some(value) = previous {
             std::env::set_var("OLLAMA_BASE_URL", value);
         }
+    }
+
+    #[test]
+    #[serial]
+    fn discovery_only_provider_accepts_explicit_default_model() {
+        let _agent = test_support::TestAgentDir::new();
+        let path = get_omp_models_path().expect("OMP models path");
+        ensure_private_omp_parent(&path).expect("create OMP agent directory");
+        fs::write(
+            &path,
+            "providers:\n  local:\n    baseUrl: http://127.0.0.1:11434\n    api: openai-completions\n    auth: none\n    discovery:\n      type: ollama\n",
+        )
+        .expect("write discovery-only provider");
+
+        let selector = set_omp_default_model("local", Some("llama3"))
+            .expect("discovery-only providers accept explicit model ids");
+        assert_eq!(selector, "local/llama3");
+        assert_eq!(
+            read_omp_model_roles()
+                .expect("read model roles")
+                .get("default")
+                .map(String::as_str),
+            Some("local/llama3")
+        );
+
+        let error = set_omp_default_model("local", None)
+            .expect_err("discovery-only providers require an explicit model id");
+        assert!(error
+            .to_string()
+            .contains("specify --model for a discovery provider"));
     }
 
     #[test]
