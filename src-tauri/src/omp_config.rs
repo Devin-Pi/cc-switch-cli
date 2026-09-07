@@ -1254,7 +1254,6 @@ pub(crate) fn set_omp_default_model(
     validate_provider_node_for_editor(provider_id, provider)?;
     let models = provider.get("models").and_then(Value::as_array);
     let discovery_only = provider.get("discovery").is_some();
-    let has_static_models = models.is_some_and(|models| !models.is_empty());
     let selected = match model_id.map(str::trim) {
         Some(model_id) if model_id.is_empty() => {
             return Err(AppError::InvalidInput(
@@ -1268,7 +1267,7 @@ pub(crate) fn set_omp_default_model(
             // has not been populated yet. Static catalogs remain strict so a
             // typo cannot silently create a dangling role.
             if !discovery_only {
-                let Some(models) = models.filter(|_| has_static_models) else {
+                let Some(models) = models.filter(|models| !models.is_empty()) else {
                     return Err(AppError::InvalidInput(format!(
                         "OMP provider '{provider_id}' has no model catalog; specify a discovery provider"
                     )));
