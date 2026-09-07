@@ -2333,6 +2333,7 @@ mod tests {
             },
             None,
             None,
+            None,
             "Local OMP",
             &mut None,
         )
@@ -2351,6 +2352,7 @@ mod tests {
                 api_key: Some("OMP_KEY".to_string()),
                 ..Default::default()
             },
+            None,
             None,
             None,
             "OMP override",
