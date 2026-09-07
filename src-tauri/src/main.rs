@@ -333,6 +333,12 @@ mod tests {
     #[serial]
     fn provider_commands_still_fail_on_future_schema_database() {
         let temp = tempfile::tempdir().expect("create temp dir");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("restrict config dir permissions");
+        }
         seed_future_schema_database(temp.path());
         let _guard = ConfigDirEnvGuard::set(temp.path());
 
