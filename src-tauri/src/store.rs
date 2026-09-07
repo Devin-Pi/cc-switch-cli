@@ -269,6 +269,14 @@ impl AppState {
             Err(error) => log::warn!("✗ Failed to synchronize Pi providers: {error}"),
         }
 
+        match crate::services::provider::ProviderService::import_omp_providers_from_live(self) {
+            Ok(count) if count > 0 => {
+                log::info!("✓ Synchronized {count} OMP provider(s) from models.yml");
+            }
+            Ok(_) => log::debug!("○ No OMP providers to synchronize"),
+            Err(error) => log::warn!("✗ Failed to synchronize OMP providers: {error}"),
+        }
+
         self.refresh_config_from_db()
     }
 
@@ -533,6 +541,7 @@ fn export_db_to_multi_app_config(db: &Database) -> Result<MultiAppConfig, AppErr
         AppType::Hermes,
         AppType::OpenClaw,
         AppType::Pi,
+        AppType::Omp,
     ] {
         let app_key = app.as_str();
         let providers = db.get_all_providers(app_key)?;
@@ -550,6 +559,7 @@ fn export_db_to_multi_app_config(db: &Database) -> Result<MultiAppConfig, AppErr
             AppType::Hermes => config.prompts.hermes.prompts = prompts.into_iter().collect(),
             AppType::OpenClaw => config.prompts.openclaw.prompts = prompts.into_iter().collect(),
             AppType::Pi => config.prompts.pi.prompts = prompts.into_iter().collect(),
+            AppType::Omp => config.prompts.omp.prompts = prompts.into_iter().collect(),
         }
 
         // common snippet
@@ -587,6 +597,8 @@ fn persist_multi_app_config_to_db_preserving_current_providers(
         AppType::OpenCode,
         AppType::Hermes,
         AppType::OpenClaw,
+        AppType::Pi,
+        AppType::Omp,
     ] {
         let app_key = app.as_str();
         let manager = config.get_manager(&app);

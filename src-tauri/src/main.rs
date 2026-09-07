@@ -54,6 +54,10 @@ fn run(cli: Cli) -> Result<(), AppError> {
         Some(Commands::Provider(cmd)) => {
             cc_switch_lib::cli::commands::provider::execute(cmd, cli.app)
         }
+        Some(Commands::Model(cmd)) => {
+            cc_switch_lib::cli::commands::omp::execute_model(cmd, cli.app)
+        }
+        Some(Commands::Role(cmd)) => cc_switch_lib::cli::commands::omp::execute_role(cmd, cli.app),
         Some(Commands::Use { id }) => cc_switch_lib::cli::commands::provider::execute(
             cc_switch_lib::cli::commands::provider::ProviderCommand::Switch { id },
             cli.app,
@@ -96,6 +100,8 @@ fn command_requires_startup_state(command: &Option<Commands>) -> bool {
     match command {
         Some(Commands::Completions(_))
         | Some(Commands::Auth(_))
+        | Some(Commands::Model(_))
+        | Some(Commands::Role(_))
         | Some(Commands::Update(_))
         | Some(Commands::Internal(_))
         | Some(Commands::Sessions(_))
@@ -129,7 +135,10 @@ fn command_uses_deferred_codex_migration(command: &Option<Commands>) -> bool {
 fn database_access_required(command: &Option<Commands>) -> bool {
     !matches!(
         command,
-        Some(Commands::Completions(_)) | Some(Commands::Update(_))
+        Some(Commands::Completions(_))
+            | Some(Commands::Model(_))
+            | Some(Commands::Role(_))
+            | Some(Commands::Update(_))
     )
 }
 
