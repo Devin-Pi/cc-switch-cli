@@ -797,6 +797,7 @@ mod tests {
             .expect("write native shared prompt");
         fs::write(runtime_override.join("SYSTEM.md"), "runtime-only prompt")
             .expect("write runtime override prompt");
+        let previous_agent_override = std::env::var_os("PI_CODING_AGENT_DIR");
         std::env::set_var("PI_CODING_AGENT_DIR", &runtime_override);
 
         let active = OmpPromptFileService::active_path(PiPromptFileKind::SystemOverride)
@@ -815,5 +816,7 @@ mod tests {
         let active = OmpPromptFileService::active_path(PiPromptFileKind::SystemAppend)
             .expect("resolve generic append prompt path");
         assert_eq!(active, default_agent.join("APPEND_SYSTEM.md"));
+
+        crate::test_support::restore_env("PI_CODING_AGENT_DIR", &previous_agent_override);
     }
 }
