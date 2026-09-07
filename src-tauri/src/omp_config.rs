@@ -924,6 +924,14 @@ fn path_matches_cwd(raw: &Path, cwd: &Path) -> bool {
 /// A project `disabledProviders` array replaces the global array, matching
 /// OMP's settings merge semantics.
 pub(crate) fn read_omp_disabled_providers() -> Result<HashSet<String>, AppError> {
+    let _guard = lock_models_file()?;
+    read_omp_disabled_providers_locked()
+}
+
+/// Read the effective disabled provider set while the caller already owns the
+/// native OMP file lock. Keeping this helper lock-free avoids recursively
+/// acquiring the non-reentrant process mutex in compound mutations.
+fn read_omp_disabled_providers_locked() -> Result<HashSet<String>, AppError> {
     let (document, path) = effective_omp_settings_document()?;
     disabled_provider_values(document.get("disabledProviders"), &path)
 }
@@ -1229,7 +1237,7 @@ pub(crate) fn set_omp_default_model(
 ) -> Result<String, AppError> {
     validate_provider_key(provider_id)?;
     let _guard = lock_models_file()?;
-    if read_omp_disabled_providers()?.contains(provider_id) {
+    if read_omp_disabled_providers_locked()?.contains(provider_id) {
         return Err(AppError::InvalidInput(format!(
             "OMP provider '{provider_id}' is disabled by config.yml disabledProviders"
         )));
@@ -5129,6 +5137,26 @@ mod tests {
         assert!(error
             .to_string()
             .contains("specify --model for a discovery provider"));
+    }
+
+    #[test]
+    #[serial]
+    fn setting_default_model_checks_disabled_provider_without_reentrant_lock() {
+        let _agent = test_support::TestAgentDir::new();
+        let models_path = get_omp_models_path().expect("OMP models path");
+        ensure_private_omp_parent(&models_path).expect("create OMP agent directory");
+        fs::write(
+            &models_path,
+            "providers:\n  local:\n    baseUrl: http://127.0.0.1:11434\n    api: openai-completions\n    auth: none\n    models:\n      - id: llama3\n",
+        )
+        .expect("write provider");
+        let config_path = get_omp_settings_path().expect("OMP config path");
+        ensure_private_omp_parent(&config_path).expect("create OMP config directory");
+        fs::write(&config_path, "disabledProviders: [local]\n").expect("disable provider");
+
+        let error = set_omp_default_model("local", Some("llama3"))
+            .expect_err("disabled providers cannot become the default");
+        assert!(error.to_string().contains("is disabled"));
     }
 
     #[test]
