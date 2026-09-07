@@ -201,27 +201,13 @@ fn sync_single_omp_file(db: &Database, file_path: &Path) -> Result<SessionSyncRe
         }
     }
 
-    // A matching tail at the old EOF identifies OMP's normal append path, so
-    // active sessions can seek straight to appended JSONL. Any mismatch is a
-    // rewrite and must rescan from the header; the durable request ledger
-    // makes that safe.
-    let (start_after_line, start_at_byte) = match previous {
-        Some(state)
-            if state.revision.complete
-                && revision.file_size > state.revision.file_size
-                && omp_prefix_tail_matches(file_path, state.revision)? =>
-        {
-            (state.last_line_offset, Some(state.revision.file_size))
-        }
-        Some(_) | None => (0, None),
-    };
-    let parsed = parse_omp_file(
-        file_path,
-        start_after_line,
-        start_at_byte,
-        revision.file_size,
-        modified,
-    )?;
+    // Always parse from the beginning. OMP normally appends JSONL, but a
+    // session can also be compacted or rewritten in place; an old EOF/tail
+    // fingerprint cannot prove that the bytes in the middle are unchanged.
+    // Full rescans are safe because the durable request/semantic ledgers make
+    // already-imported records idempotent, and they prevent silent usage loss
+    // after a rewrite followed by an append.
+    let parsed = parse_omp_file(file_path, revision.file_size, modified)?;
     let conn = lock_conn!(db.conn);
     let tx = conn
         .unchecked_transaction()
@@ -368,19 +354,6 @@ fn omp_file_revision(
     })
 }
 
-fn omp_prefix_tail_matches(file_path: &Path, previous: OMPFileRevision) -> Result<bool, AppError> {
-    let tail_len = previous.file_size.min(REVISION_TAIL_BYTES);
-    let mut tail = vec![0; tail_len as usize];
-    if tail_len > 0 {
-        let mut file = open_session_file_no_follow(file_path)
-            .map_err(|error| AppError::Config(format!("无法打开 OMP 会话文件: {error}")))?;
-        file.seek(SeekFrom::Start(previous.file_size - tail_len))
-            .and_then(|_| file.read_exact(&mut tail))
-            .map_err(|error| AppError::Config(format!("无法校验 OMP 会话追加边界: {error}")))?;
-    }
-    Ok(omp_tail_fingerprint(&tail) == previous.tail_fingerprint)
-}
-
 fn omp_tail_fingerprint(tail: &[u8]) -> u32 {
     let mut hasher = Sha256::new();
     hash_field(&mut hasher, b"pi-session-tail-v1");
@@ -391,8 +364,6 @@ fn omp_tail_fingerprint(tail: &[u8]) -> u32 {
 
 fn parse_omp_file(
     file_path: &Path,
-    start_after_line: i64,
-    start_at_byte: Option<u64>,
     snapshot_size: u64,
     file_modified_nanos: i64,
 ) -> Result<ParsedOMPFile, AppError> {
@@ -406,57 +377,6 @@ fn parse_omp_file(
     let mut session_timestamp = None;
     let mut records = Vec::new();
     let mut incomplete_tail = false;
-
-    // An append cursor points at the old complete EOF, while the session
-    // header lives near the beginning of the file. Establish the session
-    // identity once, then seek directly to that cursor; otherwise an active
-    // OMP session would be reparsed from byte zero on every sync cycle.
-    if let Some(byte_offset) =
-        start_at_byte.filter(|offset| *offset > 0 && *offset <= snapshot_size)
-    {
-        while session_id.is_none() && bytes_read < byte_offset {
-            buffer.clear();
-            let remaining = byte_offset.saturating_sub(bytes_read);
-            let read = Read::by_ref(&mut reader)
-                .take(remaining)
-                .read_line(&mut buffer)
-                .map_err(|error| AppError::Config(format!("无法读取 OMP 会话 header: {error}")))?;
-            if read == 0 {
-                break;
-            }
-            bytes_read = bytes_read.saturating_add(read as u64);
-            line_number = line_number.saturating_add(1);
-            let line = buffer.trim();
-            let Ok(value) = serde_json::from_str::<Value>(line) else {
-                if !buffer.ends_with('\n') {
-                    return Err(AppError::Config("OMP 会话 header 不完整".to_string()));
-                }
-                continue;
-            };
-            if value.get("type").and_then(Value::as_str) == Some("session") {
-                session_id = value
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .filter(|id| crate::session_manager::providers::omp::is_valid_tree_id(id))
-                    .map(str::to_string);
-                if session_id.is_none() {
-                    return Err(AppError::Config("OMP 会话 header 缺少 id".to_string()));
-                }
-                session_timestamp = value
-                    .get("timestamp")
-                    .and_then(parse_timestamp_millis)
-                    .map(|timestamp| timestamp / 1000);
-            }
-        }
-        if session_id.is_none() {
-            return Err(AppError::Config("OMP 会话没有有效 header".to_string()));
-        }
-        reader
-            .seek(SeekFrom::Start(byte_offset))
-            .map_err(|error| AppError::Config(format!("无法定位 OMP 会话增量边界: {error}")))?;
-        bytes_read = byte_offset;
-        line_number = start_after_line;
-    }
 
     loop {
         buffer.clear();
@@ -497,9 +417,6 @@ fn parse_omp_file(
                 "OMP 会话超过 {} 条 entry 安全上限",
                 crate::session_manager::providers::omp::MAX_TREE_ENTRIES
             )));
-        }
-        if session_id.is_some() && line_number <= start_after_line {
-            continue;
         }
         let Some(value) = value else {
             if !has_newline {
@@ -1238,7 +1155,7 @@ mod tests {
     }
 
     #[test]
-    fn appends_and_completes_partial_omp_tail_incrementally() -> Result<(), AppError> {
+    fn appends_and_completes_partial_omp_tail_without_duplicate_imports() -> Result<(), AppError> {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("active.jsonl");
         let header = serde_json::json!({
@@ -1284,7 +1201,8 @@ mod tests {
         file.write_all(b"\n").expect("write record newline");
         file.flush().expect("flush completed record");
         drop(file);
-        // The partial record is rescanned from the saved complete boundary.
+        // The file is safely rescanned from the beginning; request/semantic
+        // ledgers suppress the already-imported first record.
         let completed = sync_omp_files(&db, std::slice::from_ref(&path));
         assert_eq!(completed.imported, 1);
         let total: i64 = lock_conn!(db.conn).query_row(

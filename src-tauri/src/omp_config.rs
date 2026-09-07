@@ -229,7 +229,9 @@ pub(crate) fn get_omp_agent_dir() -> Result<PathBuf, AppError> {
         .unwrap_or_else(|| PathBuf::from(".omp"));
     // OMP treats `PI_CONFIG_DIR` as a directory name relative to the user's
     // home (for example `.omp`), including when a caller supplies a leading
-    // separator. Keep that upstream behavior while preventing path escape.
+    // separator. Keep that upstream join/normalization behavior; the value is
+    // an explicit user-controlled path and is not implicitly constrained to
+    // remain below `home` when it contains `..` components.
     let config_root = omp_config_root(&home, config_dir);
     let profile = effective_profile(&path_env)?;
     let default_path = profile
@@ -293,6 +295,10 @@ pub(crate) fn get_omp_sessions_dir() -> Result<PathBuf, AppError> {
         .filter(|value| !value.is_empty())
         .is_some_and(|value| !is_profile_derived_agent_dir_from_env(&config_root, value));
 
+    // OMP only enables XDG data relocation on Unix platforms. In particular,
+    // a Windows process may still inherit XDG_DATA_HOME from a CI environment
+    // or shell profile, but native OMP continues using its agent directory.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     if !explicit_agent_override && agent_dir == default_agent {
         if let Some(xdg_data) = path_env
             .get("XDG_DATA_HOME")
@@ -363,8 +369,8 @@ fn is_profile_derived_agent_dir_from_env(config_root: &Path, value: &std::ffi::O
 fn omp_config_root(home: &Path, config_dir: PathBuf) -> PathBuf {
     // OMP treats PI_CONFIG_DIR as a directory *name* under the user's home
     // (its upstream implementation uses `path.join(os.homedir(), value)`).
-    // Strip a leading separator so an accidentally absolute-looking value
-    // cannot escape that root while retaining the same join semantics.
+    // Strip a leading separator so an accidentally absolute-looking value is
+    // still interpreted as home-relative, matching OMP's path.join call.
     let config_dir = config_dir.to_string_lossy();
     normalize_omp_path(home.join(config_dir.trim_start_matches(['/', '\\'])))
 }
@@ -1616,6 +1622,13 @@ fn upsert_omp_model_inner(
     } else {
         models.push(model);
     }
+    // Adding a model changes the provider's semantic requirements. In
+    // particular, OMP requires a provider-level `baseUrl` (and either
+    // credentials or an explicit `auth` mode) whenever custom models are
+    // present. Validate the merged provider before writing so an otherwise
+    // valid override-only provider cannot be left in a state that OMP rejects
+    // on its next load.
+    validate_provider_node_for_editor(provider_id, provider)?;
     write_models_document(&path, &document, &file_revision)
 }
 
@@ -2310,9 +2323,12 @@ fn validate_provider_node_inner(
         "OMP provider transport",
     )?;
     if let Some(request_metadata) = object.get("requestMetadata") {
-        if !request_metadata.is_object() {
+        let request_metadata = request_metadata.as_object().ok_or_else(|| {
+            AppError::InvalidInput("OMP provider requestMetadata must be an object".to_string())
+        })?;
+        if request_metadata.values().any(|value| !value.is_string()) {
             return Err(AppError::InvalidInput(
-                "OMP provider requestMetadata must be an object".to_string(),
+                "OMP provider requestMetadata values must be strings".to_string(),
             ));
         }
     }
@@ -3730,9 +3746,10 @@ fn providers<'a>(document: &'a Value, path: &Path) -> Result<&'a Map<String, Val
 
 /// Validate the managed shape of the `models.yml` root.
 ///
-/// OMP's current `ModelsConfigSchema` is an exact object containing only the
-/// optional `providers` map. Reject unknown root keys before writing so an
-/// advanced edit cannot produce a file that the native OMP loader rejects.
+/// OMP's `ModelsConfigSchema` keeps unknown root keys by default. Preserve
+/// those fields so a provider edit cannot discard metadata introduced by a
+/// newer native release; only the provider map's type is constrained because
+/// it is the portion CC Switch mutates.
 fn validate_omp_models_root(document: &Value, path: &Path) -> Result<(), AppError> {
     let root = document.as_object().ok_or_else(|| {
         AppError::InvalidInput(format!(
@@ -3740,14 +3757,6 @@ fn validate_omp_models_root(document: &Value, path: &Path) -> Result<(), AppErro
             path.display()
         ))
     })?;
-    for key in root.keys() {
-        if key != "providers" {
-            return Err(AppError::InvalidInput(format!(
-                "OMP models contains unsupported root field '{key}': {}",
-                path.display()
-            )));
-        }
-    }
     if let Some(value) = root.get("providers") {
         if !value.is_object() {
             return Err(AppError::InvalidInput(format!(
@@ -3997,15 +4006,14 @@ pub(crate) fn ensure_private_omp_parent(path: &Path) -> Result<(), AppError> {
                 mode = 0o700;
             }
             let writable = mode & 0o022 != 0;
-            let world_writable = mode & 0o002 != 0;
             // A sticky world-writable ancestor such as /tmp is safe as a
             // shared container root; the managed directory itself must still
-            // remain private. Group-writable ancestors are retained for
-            // compatibility with user-managed workspace roots, while a
-            // non-sticky world-writable ancestor can redirect the path.
+            // remain private. Any other group/other-writable ancestor can let
+            // another user redirect a missing managed component before the
+            // write, so reject it even when only the group write bit is set.
             let shared_sticky_root = mode & 0o1000 != 0;
             if (ancestor == parent && writable)
-                || (ancestor != parent && world_writable && !shared_sticky_root)
+                || (ancestor != parent && writable && !shared_sticky_root)
             {
                 return Err(AppError::InvalidInput(format!(
                     "OMP managed directory cannot be group/other writable: {} ({mode:04o}); run chmod 700 {}",
@@ -4042,6 +4050,10 @@ pub(crate) mod test_support {
             let dir = tempfile::tempdir().expect("create OMP test directory");
             let agent_dir = dir.path().join("agent");
             std::fs::create_dir_all(&agent_dir).expect("create OMP test agent directory");
+            // The production writer rejects group/other-writable ancestors;
+            // tempfile directories inherit a permissive mode on some hosts,
+            // so make the isolated test root match a private user config root.
+            restrict_test_directory(dir.path());
             restrict_test_directory(&agent_dir);
             Self::set(agent_dir, Some(dir))
         }
@@ -4049,6 +4061,9 @@ pub(crate) mod test_support {
         pub(crate) fn at(agent_dir: &Path) -> Self {
             if let Err(error) = std::fs::create_dir_all(agent_dir) {
                 panic!("create OMP test agent directory: {error}");
+            }
+            if let Some(parent) = agent_dir.parent() {
+                restrict_test_directory(parent);
             }
             restrict_test_directory(agent_dir);
             Self::set(agent_dir.to_path_buf(), None)
@@ -4100,6 +4115,10 @@ pub(crate) mod test_support {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let previous = std::env::current_dir().expect("read current directory");
+            // Project-layer tests often create managed `.omp` files below a
+            // `tempfile` root. Match a real private project root before the
+            // production permission checks walk that ancestor.
+            restrict_test_directory(path);
             std::env::set_current_dir(path).expect("switch current directory");
             Self {
                 _lock: lock,
@@ -4164,6 +4183,13 @@ mod tests {
             })
         )
         .is_err());
+        assert!(validate_provider_node(
+            "invalid-metadata-value",
+            &json!({
+                "requestMetadata": {"attempt": 1}
+            })
+        )
+        .is_err());
 
         for (field, value) in [
             ("headers", json!({})),
@@ -4178,12 +4204,12 @@ mod tests {
     }
 
     #[test]
-    fn models_root_rejects_unknown_fields_like_omp_schema() {
+    fn models_root_preserves_unknown_fields_like_omp_schema() {
         let path = PathBuf::from("/tmp/omp/models.yml");
         assert!(validate_omp_models_root(&json!({"providers": {}}), &path).is_ok());
         assert!(
             validate_omp_models_root(&json!({"providers": {}, "futureSetting": true}), &path)
-                .is_err()
+                .is_ok()
         );
         assert!(validate_omp_models_root(&json!({"providers": []}), &path).is_err());
     }
@@ -4657,6 +4683,9 @@ mod tests {
             &legacy_path,
             r#"// OMP legacy JSONC supports comments and trailing commas.
             {
+              // Older OMP releases used a top-level models array. The native
+              // schema keeps this unknown field during JSON -> YAML migration.
+              models: [],
               providers: {
                 legacy: {
                   baseUrl: 'https://legacy.example/v1',
@@ -4674,6 +4703,7 @@ mod tests {
         assert!(path.exists());
         let migrated = fs::read_to_string(&path).expect("read migrated YAML");
         assert!(!migrated.contains("// OMP legacy"));
+        assert!(migrated.contains("models: []"));
         assert!(migrated.contains("providers:"));
         assert!(read_omp_native_providers()
             .expect("read migrated providers")
@@ -5055,6 +5085,28 @@ mod tests {
 
     #[test]
     #[serial]
+    fn adding_model_to_override_only_provider_is_rejected_without_mutation() {
+        let _agent = test_support::TestAgentDir::new();
+        let override_only = json!({"headers": {}});
+        insert_omp_provider("override-only", &override_only).expect("seed override provider");
+        let (_, revision) = read_omp_models_yaml().expect("read models revision");
+
+        let error = upsert_omp_model_checked(
+            "override-only",
+            "model-a",
+            json!({"id": "model-a"}),
+            &revision,
+        )
+        .expect_err("custom models require provider-level connection settings");
+        assert!(error.to_string().contains("baseUrl is required"));
+        assert_eq!(
+            read_omp_native_provider("override-only").expect("read provider"),
+            Some(override_only)
+        );
+    }
+
+    #[test]
+    #[serial]
     fn discovery_provider_base_url_uses_native_defaults_and_env_overrides() {
         for (discovery_type, expected) in [
             ("ollama", "http://127.0.0.1:11434"),
@@ -5229,6 +5281,22 @@ mod tests {
 
         assert_eq!(file_mode, 0o600);
         assert_eq!(directory_mode, 0o700);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn group_writable_omp_ancestor_is_rejected() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("create temporary root");
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o770))
+            .expect("make temporary root group-writable");
+        let path = temp.path().join("agent").join("models.yml");
+
+        let error = ensure_private_omp_parent(&path)
+            .expect_err("group-writable ancestors must not protect OMP credentials");
+        assert!(error.to_string().contains("group/other writable"));
     }
 
     #[test]
@@ -5813,7 +5881,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn unknown_root_fields_are_rejected_before_provider_crud_write() {
+    fn unknown_root_fields_survive_provider_crud_write() {
         let _agent = test_support::TestAgentDir::new();
         let path = get_omp_models_path().expect("models path");
         ensure_private_omp_parent(&path).expect("create agent directory");
@@ -5823,12 +5891,10 @@ mod tests {
         )
         .expect("write models with root metadata");
 
-        let error = insert_omp_provider("cc-switch-root-metadata", &provider())
-            .expect_err("unknown root fields should be rejected like OMP");
-        assert!(error.to_string().contains("unsupported root field"));
-        assert_eq!(
-            fs::read_to_string(&path).expect("read unchanged models"),
-            "version: 2\nproviders:\n  external:\n    baseUrl: https://external.example/v1\n"
-        );
+        insert_omp_provider("cc-switch-root-metadata", &provider())
+            .expect("unknown root fields should be preserved");
+        let written = fs::read_to_string(&path).expect("read updated models");
+        assert!(written.contains("version: 2"));
+        assert!(written.contains("cc-switch-root-metadata:"));
     }
 }
