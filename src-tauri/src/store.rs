@@ -1010,6 +1010,14 @@ wire_api = "responses"
             }),
         );
         let _env = TestEnvGuard::isolated(temp_home.path());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let config_dir = temp_home.path().join(".cc-switch");
+            std::fs::create_dir_all(&config_dir).expect("create config dir");
+            std::fs::set_permissions(&config_dir, std::fs::Permissions::from_mode(0o700))
+                .expect("restrict config dir");
+        }
 
         write_json(
             crate::codex_config::get_codex_auth_path(),
