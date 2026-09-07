@@ -4478,7 +4478,7 @@ mod tests {
             .expect("write project dotenv");
 
         let env = resolve_omp_path_environment();
-        assert!(env.get("PI_CONFIG_DIR").is_none());
+        assert!(!env.contains_key("PI_CONFIG_DIR"));
         assert_eq!(
             get_omp_shared_config_agent_dir().expect("resolve default config root"),
             home.path().join(".omp/agent")
